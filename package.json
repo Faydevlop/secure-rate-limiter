@@ -1,20 +1,35 @@
 {
   "name": "secure-rate-limiter",
-  "version": "1.0.0",
-  "description": "Advanced rate-limiting with bot detection and behavioral analysis",
+  "version": "2.0.0",
+  "description": "Advanced rate-limiting with bot detection, behavioral analysis, and DDoS protection",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node test/stress-test.js"
   },
   "keywords": [
     "rate-limiting",
     "security",
     "bot-detection",
-    "ddos-protection"
+    "ddos-protection",
+    "middleware",
+    "express",
+    "burst-protection",
+    "ip-banning"
   ],
   "author": "Faydevlop",
   "license": "MIT",
-  "dependencies": {
-    "crypto": "latest"
-  }
+  "engines": {
+    "node": ">=12.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/faydevlop/secure-rate-limiter.git"
+  },
+  "dependencies": {},
+  "devDependencies": {},
+  "files": [
+    "index.js",
+    "README.md",
+    "LICENSE"
+  ]
 }
