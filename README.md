@@ -218,4 +218,4 @@ MIT License - see LICENSE file for details.
 For issues and questions:
 - GitHub Issues: [Report a bug](https://github.com/faydevlop/secure-rate-limiter/issues)
 - Documentation: See examples above
-- Version: 2.0.0
+- Version: 3.0.0
