@@ -1,6 +1,6 @@
 {
   "name": "secure-rate-limiter",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "description": "Advanced rate-limiting with bot detection, behavioral analysis, and DDoS protection",
   "main": "index.js",
   "scripts": {

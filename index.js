@@ -6,32 +6,43 @@ class SecureRateLimiter {
   constructor(options = {}) {
     // Configurable options with more aggressive defaults
     this.windowMs = options.windowMs || 60 * 1000; // 1 minute
-    this.maxRequests = options.maxRequests || 50; // Reduced from 100
-    this.delayThresholdMs = options.delayThresholdMs || 500; // Increased threshold
-    this.burstThreshold = options.burstThreshold || 10; // Max requests in burst window
-    this.burstWindowMs = options.burstWindowMs || 5 * 1000; // 5 seconds burst window
-    this.suspiciousThreshold = options.suspiciousThreshold || 3; // Strikes before temp ban
-    this.tempBanDurationMs = options.tempBanDurationMs || 10 * 60 * 1000; // 10 minutes
+    this.maxRequests = options.maxRequests || 50; // More restrictive default
+    this.delayThresholdMs = options.delayThresholdMs || 1000; // Slower threshold
+    this.burstThreshold = options.burstThreshold || 5; // Much stricter burst detection
+    this.burstWindowMs = options.burstWindowMs || 3 * 1000; // 3 seconds burst window
+    this.suspiciousThreshold = options.suspiciousThreshold || 2; // Faster temp ban
+    this.tempBanDurationMs = options.tempBanDurationMs || 30 * 60 * 1000; // 30 minutes
+    this.strictMode = options.strictMode !== false; // Enable by default
     
+    // Enhanced bot detection
     this.botKeywords = options.botKeywords || [
       'Googlebot', 'Bingbot', 'YandexBot', 'DuckDuckBot', 'Baiduspider',
-      'curl', 'wget', 'python-requests', 'node-fetch', 'bot', 'crawler', 'spider'
+      'curl', 'wget', 'python-requests', 'node-fetch', 'bot', 'crawler', 
+      'spider', 'scraper', 'axios', 'http'
     ];
 
-    // Enhanced stores
-    this.requestStore = new Map();
+    // Enhanced stores with IP-based tracking
+    this.requestStore = new Map(); // Fingerprint-based tracking
+    this.ipRequestStore = new Map(); // IP-based tracking (primary)
     this.lastRequestTimestamps = new Map();
     this.fingerprintStore = new Map(); // Track multiple fingerprints per IP
     this.suspiciousActivity = new Map(); // Track suspicious behavior
     this.tempBans = new Map(); // Temporary bans
     this.burstTracker = new Map(); // Track burst requests
+    this.ipHeaderTracker = new Map(); // Track IP header manipulation
+    this.pathTracker = new Map(); // Track path-based patterns
     
     // Connection tracking
     this.connectionTracker = new Map();
-    this.maxConnectionsPerIP = options.maxConnectionsPerIP || 20;
+    this.maxConnectionsPerIP = options.maxConnectionsPerIP || 10; // More restrictive
+
+    // Progressive penalty system
+    this.penaltyScores = new Map();
+    this.maxPenaltyScore = options.maxPenaltyScore || 100;
+    this.penaltyDecayRate = options.penaltyDecayRate || 10; // Points removed per minute
 
     // Logs setup
-    this.logsDir = path.join(__dirname, 'logs');
+    this.logsDir = path.join(process.cwd(), 'logs');
     this.logFile = path.join(this.logsDir, 'requests.log');
     this.securityLogFile = path.join(this.logsDir, 'security.log');
 
@@ -43,41 +54,159 @@ class SecureRateLimiter {
     this.setupCleanup();
   }
 
-  // Enhanced fingerprinting with multiple factors
+  // Enhanced fingerprinting with more factors
   getFingerprint(req) {
     const ip = this.getClientIP(req);
     const ua = req.headers['user-agent'] || 'none';
     const acceptLang = req.headers['accept-language'] || 'none';
     const acceptEnc = req.headers['accept-encoding'] || 'none';
+    const accept = req.headers['accept'] || 'none';
+    const connection = req.headers['connection'] || 'none';
     
     return crypto.createHash('sha256')
-      .update(`${ip}:${ua}:${acceptLang}:${acceptEnc}`)
+      .update(`${ip}:${ua}:${acceptLang}:${acceptEnc}:${accept}:${connection}`)
       .digest('hex');
   }
 
-  // Better IP extraction considering proxies/load balancers
+  // Enhanced IP extraction with validation
   getClientIP(req) {
-    return req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
-           req.headers['x-real-ip'] ||
-           req.connection?.remoteAddress ||
-           req.socket?.remoteAddress ||
-           req.ip ||
-           'unknown';
-  }
-
-  // Detect IP spoofing attempts
-  detectIPSpoofing(req) {
     const forwardedFor = req.headers['x-forwarded-for'];
     const realIP = req.headers['x-real-ip'];
     const forwarded = req.headers['forwarded'];
+    const connection = req.connection?.remoteAddress;
+    const socket = req.socket?.remoteAddress;
+    const reqIP = req.ip;
+
+    let ip = 'unknown';
+
+    // Prioritize real connection IP over headers (more secure)
+    if (connection && !this.isPrivateIP(connection)) {
+      ip = connection;
+    } else if (socket && !this.isPrivateIP(socket)) {
+      ip = socket;
+    } else if (reqIP && !this.isPrivateIP(reqIP)) {
+      ip = reqIP;
+    } else if (forwardedFor) {
+      const ips = forwardedFor.split(',').map(ip => ip.trim());
+      ip = ips.find(ip => !this.isPrivateIP(ip)) || ips[0];
+    } else if (realIP && !this.isPrivateIP(realIP)) {
+      ip = realIP;
+    } else if (forwarded) {
+      const match = forwarded.match(/for=([^;,\s]+)/);
+      if (match) ip = match[1];
+    }
+
+    return ip;
+  }
+
+  // Check if IP is private/local
+  isPrivateIP(ip) {
+    if (!ip) return true;
+    ip = ip.replace(/^::ffff:/, ''); // Remove IPv6 prefix
     
-    // Check for multiple conflicting IP headers (common in attack scripts)
-    let ipHeaders = 0;
-    if (forwardedFor) ipHeaders++;
-    if (realIP) ipHeaders++;
-    if (forwarded) ipHeaders++;
+    const privateRanges = [
+      /^127\./, // Loopback
+      /^10\./, // Private class A
+      /^172\.(1[6-9]|2[0-9]|3[01])\./, // Private class B
+      /^192\.168\./, // Private class C
+      /^169\.254\./, // Link-local
+      /^::1$/, // IPv6 loopback
+      /^fe80::/i // IPv6 link-local
+    ];
     
-    return ipHeaders > 2; // Suspicious if too many IP headers
+    return privateRanges.some(range => range.test(ip));
+  }
+
+  // Enhanced IP spoofing detection
+  detectIPSpoofing(req) {
+    const ip = this.getClientIP(req);
+    const headers = req.headers;
+    
+    // Track different IP headers from same source
+    const ipHeaders = {
+      'x-forwarded-for': headers['x-forwarded-for'],
+      'x-real-ip': headers['x-real-ip'],
+      'forwarded': headers['forwarded'],
+      'via': headers['via']
+    };
+
+    let headerCount = 0;
+    let uniqueIPs = new Set();
+    
+    Object.values(ipHeaders).forEach(header => {
+      if (header) {
+        headerCount++;
+        if (header.includes(',')) {
+          header.split(',').forEach(ip => uniqueIPs.add(ip.trim()));
+        } else {
+          uniqueIPs.add(header.trim());
+        }
+      }
+    });
+
+    // Track IP header patterns per IP
+    const pattern = Object.keys(ipHeaders).filter(key => ipHeaders[key]).join(',');
+    const tracker = this.ipHeaderTracker.get(ip) || new Set();
+    tracker.add(pattern);
+    this.ipHeaderTracker.set(ip, tracker);
+
+    // Suspicious if too many different patterns or headers
+    return headerCount > 3 || uniqueIPs.size > 5 || tracker.size > 3;
+  }
+
+  // Enhanced path-based attack detection
+  detectPathManipulation(req) {
+    const ip = this.getClientIP(req);
+    const url = req.url || req.path || '/';
+    
+    // Track unique paths per IP
+    const paths = this.pathTracker.get(ip) || new Set();
+    paths.add(url);
+    this.pathTracker.set(ip, paths);
+    
+    // Check for query parameter manipulation (common in scripts)
+    const hasQueryParams = url.includes('?');
+    const queryParamCount = (url.match(/[?&]/g) || []).length;
+    
+    // Suspicious if too many unique paths or complex query manipulation
+    return paths.size > 20 || queryParamCount > 10;
+  }
+
+  // Progressive penalty system
+  addPenalty(ip, points, reason) {
+    const current = this.penaltyScores.get(ip) || { score: 0, lastUpdate: Date.now() };
+    current.score += points;
+    current.lastUpdate = Date.now();
+    current.reason = reason;
+    
+    this.penaltyScores.set(ip, current);
+    
+    if (current.score >= this.maxPenaltyScore) {
+      this.addTempBan(ip, `Penalty threshold exceeded: ${reason}`);
+      return true;
+    }
+    
+    return false;
+  }
+
+  // Decay penalty scores over time
+  decayPenalties() {
+    const now = Date.now();
+    for (const [ip, penalty] of this.penaltyScores.entries()) {
+      const minutesPassed = (now - penalty.lastUpdate) / (60 * 1000);
+      const decayAmount = Math.floor(minutesPassed * this.penaltyDecayRate);
+      
+      if (decayAmount > 0) {
+        penalty.score = Math.max(0, penalty.score - decayAmount);
+        penalty.lastUpdate = now;
+        
+        if (penalty.score === 0) {
+          this.penaltyScores.delete(ip);
+        } else {
+          this.penaltyScores.set(ip, penalty);
+        }
+      }
+    }
   }
 
   // Enhanced logging with security events
@@ -85,12 +214,18 @@ class SecureRateLimiter {
     const timestamp = new Date().toISOString();
     const ip = this.getClientIP(req);
     const ua = req.headers['user-agent'] || 'none';
-    const logEntry = `${timestamp} | IP: ${ip} | UA: ${ua} | Status: ${classification} | ${details}\n`;
+    const path = req.url || req.path || '/';
+    const penalty = this.penaltyScores.get(ip)?.score || 0;
+    const logEntry = `${timestamp} | IP: ${ip} | UA: ${ua} | Path: ${path} | Status: ${classification} | Penalty: ${penalty} | ${details}\n`;
 
-    fs.appendFileSync(this.logFile, logEntry, { flag: 'a' });
-    
-    if (['blocked', 'suspicious', 'temp-banned', 'ip-spoofing'].includes(classification)) {
-      fs.appendFileSync(this.securityLogFile, logEntry, { flag: 'a' });
+    try {
+      fs.appendFileSync(this.logFile, logEntry, { flag: 'a' });
+      
+      if (['blocked', 'suspicious', 'temp-banned', 'ip-spoofing', 'penalty-ban'].includes(classification)) {
+        fs.appendFileSync(this.securityLogFile, logEntry, { flag: 'a' });
+      }
+    } catch (error) {
+      console.error('Logging error:', error);
     }
   }
 
@@ -109,21 +244,27 @@ class SecureRateLimiter {
 
   // Add IP to temporary ban list
   addTempBan(ip, reason) {
+    const existing = this.tempBans.get(ip);
     this.tempBans.set(ip, { 
       timestamp: Date.now(), 
       reason,
-      attempts: (this.tempBans.get(ip)?.attempts || 0) + 1
+      attempts: (existing?.attempts || 0) + 1
     });
   }
 
-  // Track suspicious activity
-  trackSuspiciousActivity(ip, reason) {
+  // Track suspicious activity with enhanced scoring
+  trackSuspiciousActivity(ip, reason, penaltyPoints = 10) {
     const current = this.suspiciousActivity.get(ip) || { count: 0, reasons: [] };
     current.count++;
     current.reasons.push(reason);
     current.lastActivity = Date.now();
     
     this.suspiciousActivity.set(ip, current);
+    
+    // Add penalty points
+    if (this.addPenalty(ip, penaltyPoints, reason)) {
+      return true; // Banned due to penalty
+    }
     
     if (current.count >= this.suspiciousThreshold) {
       this.addTempBan(ip, `Suspicious activity: ${current.reasons.join(', ')}`);
@@ -133,7 +274,7 @@ class SecureRateLimiter {
     return false;
   }
 
-  // Enhanced rate limiting with burst detection
+  // Enhanced rate limiting with dual tracking (IP + fingerprint)
   rateLimit(req) {
     const fingerprint = this.getFingerprint(req);
     const ip = this.getClientIP(req);
@@ -142,40 +283,56 @@ class SecureRateLimiter {
     // Check temp ban first
     if (this.isTempBanned(ip)) {
       this.logRequest(req, 'temp-banned', 'IP temporarily banned');
-      return { allowed: false, reason: 'Temporarily banned' };
+      return { allowed: false, reason: 'Temporarily banned', httpCode: 429 };
     }
 
-    // Burst detection
+    // PRIMARY: IP-based rate limiting (more reliable)
+    let ipEntry = this.ipRequestStore.get(ip);
+    if (!ipEntry || now - ipEntry.lastReset > this.windowMs) {
+      ipEntry = { count: 1, lastReset: now };
+      this.ipRequestStore.set(ip, ipEntry);
+    } else {
+      ipEntry.count++;
+      if (ipEntry.count > this.maxRequests) {
+        if (this.trackSuspiciousActivity(ip, 'ip-rate-limit-exceeded', 20)) {
+          return { allowed: false, reason: 'Temporarily banned for rate limit violations', httpCode: 429 };
+        }
+        this.logRequest(req, 'blocked', 'IP rate limit exceeded');
+        return { allowed: false, reason: 'Rate limit exceeded', httpCode: 429 };
+      }
+    }
+
+    // SECONDARY: Fingerprint-based tracking (backup)
+    let fingerprintEntry = this.requestStore.get(fingerprint);
+    if (!fingerprintEntry || now - fingerprintEntry.lastReset > this.windowMs) {
+      fingerprintEntry = { count: 1, lastReset: now, ip };
+      this.requestStore.set(fingerprint, fingerprintEntry);
+    } else {
+      fingerprintEntry.count++;
+      if (fingerprintEntry.count > this.maxRequests * 1.5) { // More lenient for fingerprints
+        if (this.trackSuspiciousActivity(ip, 'fingerprint-rate-limit-exceeded', 15)) {
+          return { allowed: false, reason: 'Temporarily banned', httpCode: 429 };
+        }
+        this.logRequest(req, 'blocked', 'Fingerprint rate limit exceeded');
+        return { allowed: false, reason: 'Rate limit exceeded', httpCode: 429 };
+      }
+    }
+
+    // Burst detection (per IP)
     let burstEntry = this.burstTracker.get(ip);
     if (!burstEntry || now - burstEntry.windowStart > this.burstWindowMs) {
       burstEntry = { count: 1, windowStart: now };
     } else {
       burstEntry.count++;
       if (burstEntry.count > this.burstThreshold) {
-        if (this.trackSuspiciousActivity(ip, 'burst-requests')) {
-          return { allowed: false, reason: 'Temporarily banned for burst activity' };
+        if (this.trackSuspiciousActivity(ip, 'burst-requests', 25)) {
+          return { allowed: false, reason: 'Temporarily banned for burst activity', httpCode: 429 };
         }
         this.logRequest(req, 'blocked', 'Burst limit exceeded');
-        return { allowed: false, reason: 'Too many requests in short time' };
+        return { allowed: false, reason: 'Too many requests in short time', httpCode: 429 };
       }
     }
     this.burstTracker.set(ip, burstEntry);
-
-    // Regular rate limiting
-    let entry = this.requestStore.get(fingerprint);
-    if (!entry || now - entry.lastReset > this.windowMs) {
-      entry = { count: 1, lastReset: now, ip };
-      this.requestStore.set(fingerprint, entry);
-    } else {
-      entry.count++;
-      if (entry.count > this.maxRequests) {
-        if (this.trackSuspiciousActivity(ip, 'rate-limit-exceeded')) {
-          return { allowed: false, reason: 'Temporarily banned for rate limit violations' };
-        }
-        this.logRequest(req, 'blocked', 'Rate limit exceeded');
-        return { allowed: false, reason: 'Rate limit exceeded' };
-      }
-    }
 
     return { allowed: true };
   }
@@ -190,22 +347,31 @@ class SecureRateLimiter {
       ua.toLowerCase().includes(keyword.toLowerCase())
     );
     
-    if (hasBot) return true;
-
-    // Pattern-based detection
-    // 1. Missing or suspicious User-Agent
-    if (!ua || ua.length < 10 || ua === 'none') {
-      this.trackSuspiciousActivity(ip, 'suspicious-user-agent');
+    if (hasBot) {
+      this.trackSuspiciousActivity(ip, 'bot-user-agent', 30);
       return true;
     }
 
-    // 2. Unusual header combinations
-    const hasAccept = req.headers.accept;
-    const hasAcceptLang = req.headers['accept-language'];
-    const hasAcceptEnc = req.headers['accept-encoding'];
+    // Enhanced pattern-based detection
+    // 1. Missing or suspicious User-Agent
+    if (!ua || ua.length < 10 || ua === 'none' || ua.includes('http') || ua.includes('curl')) {
+      this.trackSuspiciousActivity(ip, 'suspicious-user-agent', 25);
+      return true;
+    }
+
+    // 2. Missing critical headers (legitimate browsers always send these)
+    const requiredHeaders = ['accept', 'accept-language', 'accept-encoding'];
+    const missingHeaders = requiredHeaders.filter(header => !req.headers[header]);
     
-    if (!hasAccept && !hasAcceptLang && !hasAcceptEnc) {
-      this.trackSuspiciousActivity(ip, 'missing-standard-headers');
+    if (missingHeaders.length >= 2) {
+      this.trackSuspiciousActivity(ip, `missing-headers-${missingHeaders.join(',')}`, 20);
+      return true;
+    }
+
+    // 3. Suspicious header combinations
+    const accept = req.headers.accept || '';
+    if (accept.includes('*/*') && accept.length < 10) {
+      this.trackSuspiciousActivity(ip, 'simple-accept-header', 15);
       return true;
     }
 
@@ -223,9 +389,11 @@ class SecureRateLimiter {
     
     const timeDiff = now - lastTimestamp;
     
-    // Too fast requests (script-like)
+    // Too fast requests (script-like) - More aggressive detection
     if (lastTimestamp > 0 && timeDiff < this.delayThresholdMs) {
-      this.trackSuspiciousActivity(ip, 'too-fast-requests');
+      if (this.trackSuspiciousActivity(ip, 'too-fast-requests', 20)) {
+        return true;
+      }
       return true;
     }
 
@@ -234,9 +402,9 @@ class SecureRateLimiter {
     ipFingerprints.add(fingerprint);
     this.fingerprintStore.set(ip, ipFingerprints);
     
-    // If too many different fingerprints from same IP, it's suspicious
-    if (ipFingerprints.size > 5) {
-      this.trackSuspiciousActivity(ip, 'multiple-fingerprints');
+    // More aggressive fingerprint tracking
+    if (ipFingerprints.size > 3) {
+      this.trackSuspiciousActivity(ip, `multiple-fingerprints-${ipFingerprints.size}`, 15);
       return true;
     }
 
@@ -249,37 +417,42 @@ class SecureRateLimiter {
     const current = this.connectionTracker.get(ip) || 0;
     
     if (current >= this.maxConnectionsPerIP) {
-      this.trackSuspiciousActivity(ip, 'too-many-connections');
+      this.trackSuspiciousActivity(ip, 'too-many-connections', 20);
       return false;
     }
     
     this.connectionTracker.set(ip, current + 1);
     
     // Clean up connection when response ends
-    req.on('close', () => {
+    const cleanup = () => {
       const count = this.connectionTracker.get(ip) || 1;
       if (count <= 1) {
         this.connectionTracker.delete(ip);
       } else {
         this.connectionTracker.set(ip, count - 1);
       }
-    });
+    };
+
+    req.on('close', cleanup);
+    req.on('end', cleanup);
     
     return true;
   }
 
   // Setup cleanup intervals
   setupCleanup() {
-    // Clean up old entries every 5 minutes
+    // Clean up old entries every 2 minutes
     setInterval(() => {
       const now = Date.now();
       
-      // Clean rate limit store
-      for (const [key, entry] of this.requestStore.entries()) {
-        if (now - entry.lastReset > this.windowMs * 2) {
-          this.requestStore.delete(key);
+      // Clean rate limit stores
+      [this.requestStore, this.ipRequestStore].forEach(store => {
+        for (const [key, entry] of store.entries()) {
+          if (now - entry.lastReset > this.windowMs * 2) {
+            store.delete(key);
+          }
         }
-      }
+      });
       
       // Clean timestamps
       for (const [key, timestamp] of this.lastRequestTimestamps.entries()) {
@@ -295,81 +468,129 @@ class SecureRateLimiter {
         }
       }
       
-      // Clean suspicious activity (after 1 hour)
+      // Clean suspicious activity (after 30 minutes)
       for (const [key, entry] of this.suspiciousActivity.entries()) {
-        if (now - entry.lastActivity > 60 * 60 * 1000) {
+        if (now - entry.lastActivity > 30 * 60 * 1000) {
           this.suspiciousActivity.delete(key);
         }
       }
+
+      // Clean path tracker (after 1 hour)
+      for (const [key, paths] of this.pathTracker.entries()) {
+        if (paths.size === 0 || now - (this.lastRequestTimestamps.get(key) || 0) > 60 * 60 * 1000) {
+          this.pathTracker.delete(key);
+        }
+      }
+
+      // Decay penalty scores
+      this.decayPenalties();
       
-    }, 5 * 60 * 1000); // Every 5 minutes
+    }, 2 * 60 * 1000); // Every 2 minutes
   }
 
-  // Enhanced middleware
+  // Enhanced middleware with comprehensive protection
   middleware() {
     return (req, res, next) => {
       const ip = this.getClientIP(req);
       
-      // 1. Check connection limit
-      if (!this.trackConnection(req)) {
-        this.logRequest(req, 'blocked', 'Too many connections');
-        res.status(429).send('Too Many Connections');
-        return;
-      }
+      try {
+        // 1. Check connection limit
+        if (!this.trackConnection(req)) {
+          this.logRequest(req, 'blocked', 'Too many connections');
+          res.status(503).send('Service Temporarily Unavailable');
+          return;
+        }
 
-      // 2. Check for IP spoofing
-      if (this.detectIPSpoofing(req)) {
-        this.logRequest(req, 'blocked', 'IP spoofing detected');
-        this.trackSuspiciousActivity(ip, 'ip-spoofing');
-        res.status(403).send('Forbidden: Invalid headers');
-        return;
-      }
+        // 2. Check for IP spoofing
+        if (this.detectIPSpoofing(req)) {
+          this.logRequest(req, 'blocked', 'IP spoofing detected');
+          this.trackSuspiciousActivity(ip, 'ip-spoofing', 30);
+          res.status(403).send('Forbidden');
+          return;
+        }
 
-      // 3. Check rate limit (includes temp ban check)
-      const rateLimitResult = this.rateLimit(req);
-      if (!rateLimitResult.allowed) {
-        res.status(429).send(rateLimitResult.reason);
-        return;
-      }
+        // 3. Check for path manipulation
+        if (this.strictMode && this.detectPathManipulation(req)) {
+          this.logRequest(req, 'blocked', 'Path manipulation detected');
+          this.trackSuspiciousActivity(ip, 'path-manipulation', 20);
+          res.status(403).send('Forbidden');
+          return;
+        }
 
-      // 4. Block bots
-      if (this.isBot(req)) {
-        this.logRequest(req, 'blocked', 'Bot detected');
-        res.status(403).send('Forbidden: Bot detected');
-        return;
-      }
+        // 4. Check rate limit (includes temp ban check)
+        const rateLimitResult = this.rateLimit(req);
+        if (!rateLimitResult.allowed) {
+          res.status(rateLimitResult.httpCode || 429).send(rateLimitResult.reason);
+          return;
+        }
 
-      // 5. Block script-like behavior
-      if (this.isScriptLike(req)) {
-        this.logRequest(req, 'blocked', 'Script-like behavior');
-        res.status(429).send('Too Fast: Script-like behavior detected');
-        return;
-      }
+        // 5. Block bots (before behavioral analysis)
+        if (this.isBot(req)) {
+          this.logRequest(req, 'blocked', 'Bot detected');
+          res.status(403).send('Forbidden');
+          return;
+        }
 
-      // Legitimate request
-      this.logRequest(req, 'allowed');
-      next();
+        // 6. Block script-like behavior
+        if (this.isScriptLike(req)) {
+          this.logRequest(req, 'blocked', 'Script-like behavior');
+          res.status(429).send('Too Many Requests');
+          return;
+        }
+
+        // Legitimate request
+        this.logRequest(req, 'allowed');
+        next();
+
+      } catch (error) {
+        console.error('Rate limiter error:', error);
+        // Fail open for reliability, but log the error
+        this.logRequest(req, 'error', `Middleware error: ${error.message}`);
+        next();
+      }
     };
   }
 
-  // Get statistics
+  // Get comprehensive statistics
   getStats() {
     return {
       totalFingerprints: this.requestStore.size,
+      totalIPs: this.ipRequestStore.size,
       tempBannedIPs: this.tempBans.size,
       suspiciousIPs: this.suspiciousActivity.size,
-      activeConnections: Array.from(this.connectionTracker.values()).reduce((a, b) => a + b, 0)
+      penalizedIPs: this.penaltyScores.size,
+      activeConnections: Array.from(this.connectionTracker.values()).reduce((a, b) => a + b, 0),
+      pathTrackingEntries: this.pathTracker.size,
+      ipHeaderPatterns: this.ipHeaderTracker.size
     };
   }
 
-  // Manual IP ban/unban methods
-  banIP(ip, reason = 'Manual ban') {
+  // Enhanced manual IP management
+  banIP(ip, reason = 'Manual ban', duration = null) {
     this.addTempBan(ip, reason);
+    if (duration) {
+      setTimeout(() => this.unbanIP(ip), duration);
+    }
   }
 
   unbanIP(ip) {
     this.tempBans.delete(ip);
     this.suspiciousActivity.delete(ip);
+    this.penaltyScores.delete(ip);
+  }
+
+  // Get detailed IP information
+  getIPInfo(ip) {
+    return {
+      isBanned: this.isTempBanned(ip),
+      banInfo: this.tempBans.get(ip),
+      suspiciousActivity: this.suspiciousActivity.get(ip),
+      penaltyScore: this.penaltyScores.get(ip),
+      fingerprints: this.fingerprintStore.get(ip)?.size || 0,
+      connections: this.connectionTracker.get(ip) || 0,
+      requests: this.ipRequestStore.get(ip),
+      headerPatterns: this.ipHeaderTracker.get(ip)?.size || 0
+    };
   }
 }
 
