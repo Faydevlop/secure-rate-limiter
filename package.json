@@ -1,0 +1,20 @@
+{
+  "name": "secure-rate-limiter",
+  "version": "1.0.0",
+  "description": "Advanced rate-limiting with bot detection and behavioral analysis",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "rate-limiting",
+    "security",
+    "bot-detection",
+    "ddos-protection"
+  ],
+  "author": "Faydevlop",
+  "license": "MIT",
+  "dependencies": {
+    "crypto": "latest"
+  }
+}
