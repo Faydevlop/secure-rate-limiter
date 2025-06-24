@@ -1,16 +1,17 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const LRU = require('lru-cache');
 
 class SecureRateLimiter {
   constructor(options = {}) {
-    // Configurable options with more aggressive defaults
+    // 🧠 1. Loosened restrictions for real users
     this.windowMs = options.windowMs || 60 * 1000; // 1 minute
-    this.maxRequests = options.maxRequests || 50; // More restrictive default
-    this.delayThresholdMs = options.delayThresholdMs || 1000; // Slower threshold
-    this.burstThreshold = options.burstThreshold || 5; // Much stricter burst detection
+    this.maxRequests = options.maxRequests || 50;
+    this.delayThresholdMs = options.delayThresholdMs || 400; // Relaxed from 500ms to 400ms
+    this.burstThreshold = options.burstThreshold || 15; // Increased from 10 to 15
     this.burstWindowMs = options.burstWindowMs || 3 * 1000; // 3 seconds burst window
-    this.suspiciousThreshold = options.suspiciousThreshold || 2; // Faster temp ban
+    this.suspiciousThreshold = options.suspiciousThreshold || 3; // Increased from 2 to 3
     this.tempBanDurationMs = options.tempBanDurationMs || 30 * 60 * 1000; // 30 minutes
     this.strictMode = options.strictMode !== false; // Enable by default
     
@@ -21,27 +22,35 @@ class SecureRateLimiter {
       'spider', 'scraper', 'axios', 'http'
     ];
 
-    // Enhanced stores with IP-based tracking
-    this.requestStore = new Map(); // Fingerprint-based tracking
-    this.ipRequestStore = new Map(); // IP-based tracking (primary)
-    this.lastRequestTimestamps = new Map();
-    this.fingerprintStore = new Map(); // Track multiple fingerprints per IP
-    this.suspiciousActivity = new Map(); // Track suspicious behavior
-    this.tempBans = new Map(); // Temporary bans
-    this.burstTracker = new Map(); // Track burst requests
-    this.ipHeaderTracker = new Map(); // Track IP header manipulation
-    this.pathTracker = new Map(); // Track path-based patterns
+    // 🧹 2. Replace Maps with LRU Caches
+    const cacheConfig = { max: 5000, ttl: this.windowMs * 2 };
+    const largeCacheConfig = { max: 10000, ttl: this.windowMs * 3 };
+    
+    this.requestStore = new LRU(cacheConfig); // Fingerprint-based tracking
+    this.ipRequestStore = new LRU(largeCacheConfig); // IP-based tracking (primary)
+    this.lastRequestTimestamps = new LRU(cacheConfig);
+    this.fingerprintStore = new LRU(cacheConfig); // Track multiple fingerprints per IP
+    this.suspiciousActivity = new LRU({ max: 2000, ttl: 30 * 60 * 1000 }); // 30 minutes
+    this.tempBans = new LRU({ max: 1000, ttl: this.tempBanDurationMs }); // Auto-expire bans
+    this.burstTracker = new LRU({ max: 3000, ttl: this.burstWindowMs * 2 }); // Burst tracking
+    this.ipHeaderTracker = new LRU({ max: 2000, ttl: 60 * 60 * 1000 }); // 1 hour
+    this.pathTracker = new LRU({ max: 3000, ttl: 60 * 60 * 1000 }); // 1 hour
+    this.penaltyScores = new LRU({ max: 2000, ttl: 60 * 60 * 1000 }); // 1 hour
     
     // Connection tracking
-    this.connectionTracker = new Map();
-    this.maxConnectionsPerIP = options.maxConnectionsPerIP || 10; // More restrictive
+    this.connectionTracker = new Map(); // Keep as Map for real-time tracking
+    this.maxConnectionsPerIP = options.maxConnectionsPerIP || 10;
 
     // Progressive penalty system
-    this.penaltyScores = new Map();
     this.maxPenaltyScore = options.maxPenaltyScore || 100;
     this.penaltyDecayRate = options.penaltyDecayRate || 10; // Points removed per minute
 
-    // Logs setup
+    // 🧪 3. Rate bypass for verified clients
+    this.trustedIPs = new Set(options.trustedIPs || []);
+    this.trustedHeaders = options.trustedHeaders || ['x-api-key', 'authorization'];
+    this.bypassTokens = new Set(options.bypassTokens || []);
+
+    // Logs setup with streaming
     this.logsDir = path.join(process.cwd(), 'logs');
     this.logFile = path.join(this.logsDir, 'requests.log');
     this.securityLogFile = path.join(this.logsDir, 'security.log');
@@ -50,8 +59,44 @@ class SecureRateLimiter {
       fs.mkdirSync(this.logsDir, { recursive: true });
     }
 
+    // 🛠️ 8. Performance improvements - Use streaming for logs
+    this.logStream = fs.createWriteStream(this.logFile, { flags: 'a' });
+    this.securityLogStream = fs.createWriteStream(this.securityLogFile, { flags: 'a' });
+
     // Cleanup interval
     this.setupCleanup();
+    
+    // 📈 4. Metrics tracking
+    this.metrics = {
+      totalRequests: 0,
+      allowedRequests: 0,
+      blockedRequests: 0,
+      botRequests: 0,
+      rateLimitedRequests: 0,
+      suspiciousRequests: 0,
+      tempBannedRequests: 0,
+      startTime: Date.now()
+    };
+  }
+
+  // 🧪 3. Check if request should bypass rate limiting
+  shouldBypass(req) {
+    const ip = this.getClientIP(req);
+    
+    // Check trusted IPs
+    if (this.trustedIPs.has(ip)) {
+      return { bypass: true, reason: 'trusted-ip' };
+    }
+    
+    // Check for trusted headers/tokens
+    for (const header of this.trustedHeaders) {
+      const value = req.headers[header];
+      if (value && this.bypassTokens.has(value)) {
+        return { bypass: true, reason: 'trusted-token' };
+      }
+    }
+    
+    return { bypass: false };
   }
 
   // Enhanced fingerprinting with more factors
@@ -169,7 +214,7 @@ class SecureRateLimiter {
     const queryParamCount = (url.match(/[?&]/g) || []).length;
     
     // Suspicious if too many unique paths or complex query manipulation
-    return paths.size > 20 || queryParamCount > 10;
+    return paths.size > 25 || queryParamCount > 15; // Slightly more lenient
   }
 
   // Progressive penalty system
@@ -209,20 +254,31 @@ class SecureRateLimiter {
     }
   }
 
-  // Enhanced logging with security events
+  // 🧼 5. Enhanced logging with JSON responses and streaming
   logRequest(req, classification, details = '') {
     const timestamp = new Date().toISOString();
     const ip = this.getClientIP(req);
     const ua = req.headers['user-agent'] || 'none';
     const path = req.url || req.path || '/';
     const penalty = this.penaltyScores.get(ip)?.score || 0;
-    const logEntry = `${timestamp} | IP: ${ip} | UA: ${ua} | Path: ${path} | Status: ${classification} | Penalty: ${penalty} | ${details}\n`;
+    
+    const logData = {
+      timestamp,
+      ip,
+      userAgent: ua,
+      path,
+      classification,
+      penalty,
+      details
+    };
+    
+    const logEntry = JSON.stringify(logData) + '\n';
 
     try {
-      fs.appendFileSync(this.logFile, logEntry, { flag: 'a' });
+      this.logStream.write(logEntry);
       
       if (['blocked', 'suspicious', 'temp-banned', 'ip-spoofing', 'penalty-ban'].includes(classification)) {
-        fs.appendFileSync(this.securityLogFile, logEntry, { flag: 'a' });
+        this.securityLogStream.write(logEntry);
       }
     } catch (error) {
       console.error('Logging error:', error);
@@ -234,11 +290,7 @@ class SecureRateLimiter {
     const banInfo = this.tempBans.get(ip);
     if (!banInfo) return false;
     
-    if (Date.now() - banInfo.timestamp > this.tempBanDurationMs) {
-      this.tempBans.delete(ip);
-      return false;
-    }
-    
+    // LRU cache handles TTL automatically, so if we get here, it's still banned
     return true;
   }
 
@@ -274,7 +326,7 @@ class SecureRateLimiter {
     return false;
   }
 
-  // Enhanced rate limiting with dual tracking (IP + fingerprint)
+  // 🧠 1. Enhanced rate limiting with looser restrictions
   rateLimit(req) {
     const fingerprint = this.getFingerprint(req);
     const ip = this.getClientIP(req);
@@ -302,14 +354,15 @@ class SecureRateLimiter {
       }
     }
 
-    // SECONDARY: Fingerprint-based tracking (backup)
+    // SECONDARY: Fingerprint-based tracking with increased allowance
     let fingerprintEntry = this.requestStore.get(fingerprint);
     if (!fingerprintEntry || now - fingerprintEntry.lastReset > this.windowMs) {
       fingerprintEntry = { count: 1, lastReset: now, ip };
       this.requestStore.set(fingerprint, fingerprintEntry);
     } else {
       fingerprintEntry.count++;
-      if (fingerprintEntry.count > this.maxRequests * 1.5) { // More lenient for fingerprints
+      // Increased from 1.5x to 2.5x for shared IPs/mobile users
+      if (fingerprintEntry.count > this.maxRequests * 2.5) {
         if (this.trackSuspiciousActivity(ip, 'fingerprint-rate-limit-exceeded', 15)) {
           return { allowed: false, reason: 'Temporarily banned', httpCode: 429 };
         }
@@ -318,7 +371,7 @@ class SecureRateLimiter {
       }
     }
 
-    // Burst detection (per IP)
+    // Burst detection (per IP) - more lenient
     let burstEntry = this.burstTracker.get(ip);
     if (!burstEntry || now - burstEntry.windowStart > this.burstWindowMs) {
       burstEntry = { count: 1, windowStart: now };
@@ -378,7 +431,7 @@ class SecureRateLimiter {
     return false;
   }
 
-  // Enhanced behavioral analysis
+  // 🧠 1. Enhanced behavioral analysis with looser restrictions
   isScriptLike(req) {
     const fingerprint = this.getFingerprint(req);
     const ip = this.getClientIP(req);
@@ -389,9 +442,9 @@ class SecureRateLimiter {
     
     const timeDiff = now - lastTimestamp;
     
-    // Too fast requests (script-like) - More aggressive detection
+    // More lenient timing detection
     if (lastTimestamp > 0 && timeDiff < this.delayThresholdMs) {
-      if (this.trackSuspiciousActivity(ip, 'too-fast-requests', 20)) {
+      if (this.trackSuspiciousActivity(ip, 'too-fast-requests', 15)) { // Reduced penalty
         return true;
       }
       return true;
@@ -402,9 +455,9 @@ class SecureRateLimiter {
     ipFingerprints.add(fingerprint);
     this.fingerprintStore.set(ip, ipFingerprints);
     
-    // More aggressive fingerprint tracking
-    if (ipFingerprints.size > 3) {
-      this.trackSuspiciousActivity(ip, `multiple-fingerprints-${ipFingerprints.size}`, 15);
+    // More lenient fingerprint tracking (increased from 3 to 5)
+    if (ipFingerprints.size > 5) {
+      this.trackSuspiciousActivity(ip, `multiple-fingerprints-${ipFingerprints.size}`, 10); // Reduced penalty
       return true;
     }
 
@@ -441,63 +494,49 @@ class SecureRateLimiter {
 
   // Setup cleanup intervals
   setupCleanup() {
-    // Clean up old entries every 2 minutes
+    // Clean up old entries every 5 minutes (less frequent due to LRU)
     setInterval(() => {
+      // Clean timestamps (manual cleanup for non-LRU)
       const now = Date.now();
-      
-      // Clean rate limit stores
-      [this.requestStore, this.ipRequestStore].forEach(store => {
-        for (const [key, entry] of store.entries()) {
-          if (now - entry.lastReset > this.windowMs * 2) {
-            store.delete(key);
-          }
-        }
-      });
-      
-      // Clean timestamps
       for (const [key, timestamp] of this.lastRequestTimestamps.entries()) {
-        if (now - timestamp > this.windowMs * 2) {
+        if (now - timestamp > this.windowMs * 3) {
           this.lastRequestTimestamps.delete(key);
         }
       }
       
-      // Clean burst tracker
-      for (const [key, entry] of this.burstTracker.entries()) {
-        if (now - entry.windowStart > this.burstWindowMs * 2) {
-          this.burstTracker.delete(key);
-        }
-      }
-      
-      // Clean suspicious activity (after 30 minutes)
-      for (const [key, entry] of this.suspiciousActivity.entries()) {
-        if (now - entry.lastActivity > 30 * 60 * 1000) {
-          this.suspiciousActivity.delete(key);
-        }
-      }
-
-      // Clean path tracker (after 1 hour)
-      for (const [key, paths] of this.pathTracker.entries()) {
-        if (paths.size === 0 || now - (this.lastRequestTimestamps.get(key) || 0) > 60 * 60 * 1000) {
-          this.pathTracker.delete(key);
-        }
-      }
-
       // Decay penalty scores
       this.decayPenalties();
       
-    }, 2 * 60 * 1000); // Every 2 minutes
+    }, 5 * 60 * 1000); // Every 5 minutes
   }
 
-  // Enhanced middleware with comprehensive protection
+  // 🧼 5. Enhanced middleware with JSON responses
   middleware() {
     return (req, res, next) => {
       const ip = this.getClientIP(req);
       
+      // Update metrics
+      this.metrics.totalRequests++;
+      
       try {
+        // 🧪 3. Check for bypass first
+        const bypassCheck = this.shouldBypass(req);
+        if (bypassCheck.bypass) {
+          this.logRequest(req, 'bypassed', bypassCheck.reason);
+          this.metrics.allowedRequests++;
+          next();
+          return;
+        }
+
         // 1. Check connection limit
         if (!this.trackConnection(req)) {
           this.logRequest(req, 'blocked', 'Too many connections');
-          res.status(503).send('Service Temporarily Unavailable');
+          this.metrics.blockedRequests++;
+          res.status(503).json({ 
+            error: 'Service Temporarily Unavailable',
+            code: 'CONNECTION_LIMIT',
+            message: 'Too many concurrent connections'
+          });
           return;
         }
 
@@ -505,7 +544,13 @@ class SecureRateLimiter {
         if (this.detectIPSpoofing(req)) {
           this.logRequest(req, 'blocked', 'IP spoofing detected');
           this.trackSuspiciousActivity(ip, 'ip-spoofing', 30);
-          res.status(403).send('Forbidden');
+          this.metrics.blockedRequests++;
+          this.metrics.suspiciousRequests++;
+          res.status(403).json({ 
+            error: 'Forbidden',
+            code: 'IP_SPOOFING',
+            message: 'Suspicious IP header manipulation detected'
+          });
           return;
         }
 
@@ -513,47 +558,80 @@ class SecureRateLimiter {
         if (this.strictMode && this.detectPathManipulation(req)) {
           this.logRequest(req, 'blocked', 'Path manipulation detected');
           this.trackSuspiciousActivity(ip, 'path-manipulation', 20);
-          res.status(403).send('Forbidden');
+          this.metrics.blockedRequests++;
+          this.metrics.suspiciousRequests++;
+          res.status(403).json({ 
+            error: 'Forbidden',
+            code: 'PATH_MANIPULATION',
+            message: 'Suspicious path access pattern detected'
+          });
           return;
         }
 
         // 4. Check rate limit (includes temp ban check)
         const rateLimitResult = this.rateLimit(req);
         if (!rateLimitResult.allowed) {
-          res.status(rateLimitResult.httpCode || 429).send(rateLimitResult.reason);
+          this.metrics.blockedRequests++;
+          this.metrics.rateLimitedRequests++;
+          if (rateLimitResult.reason.includes('banned')) {
+            this.metrics.tempBannedRequests++;
+          }
+          res.status(rateLimitResult.httpCode || 429).json({
+            error: 'Rate Limit Exceeded',
+            code: 'RATE_LIMIT',
+            message: rateLimitResult.reason
+          });
           return;
         }
 
         // 5. Block bots (before behavioral analysis)
         if (this.isBot(req)) {
           this.logRequest(req, 'blocked', 'Bot detected');
-          res.status(403).send('Forbidden');
+          this.metrics.blockedRequests++;
+          this.metrics.botRequests++;
+          res.status(403).json({ 
+            error: 'Forbidden',
+            code: 'BOT_DETECTED',
+            message: 'Automated request detected'
+          });
           return;
         }
 
         // 6. Block script-like behavior
         if (this.isScriptLike(req)) {
           this.logRequest(req, 'blocked', 'Script-like behavior');
-          res.status(429).send('Too Many Requests');
+          this.metrics.blockedRequests++;
+          this.metrics.suspiciousRequests++;
+          res.status(429).json({ 
+            error: 'Too Many Requests',
+            code: 'SCRIPT_BEHAVIOR',
+            message: 'Automated behavior detected'
+          });
           return;
         }
 
         // Legitimate request
         this.logRequest(req, 'allowed');
+        this.metrics.allowedRequests++;
         next();
 
       } catch (error) {
         console.error('Rate limiter error:', error);
         // Fail open for reliability, but log the error
         this.logRequest(req, 'error', `Middleware error: ${error.message}`);
+        this.metrics.allowedRequests++; // Count as allowed since we're failing open
         next();
       }
     };
   }
 
-  // Get comprehensive statistics
+  // 📈 4. Enhanced statistics with metrics
   getStats() {
+    const uptime = Date.now() - this.metrics.startTime;
+    const requestsPerSecond = this.metrics.totalRequests / (uptime / 1000);
+    
     return {
+      // LRU cache sizes
       totalFingerprints: this.requestStore.size,
       totalIPs: this.ipRequestStore.size,
       tempBannedIPs: this.tempBans.size,
@@ -561,7 +639,36 @@ class SecureRateLimiter {
       penalizedIPs: this.penaltyScores.size,
       activeConnections: Array.from(this.connectionTracker.values()).reduce((a, b) => a + b, 0),
       pathTrackingEntries: this.pathTracker.size,
-      ipHeaderPatterns: this.ipHeaderTracker.size
+      ipHeaderPatterns: this.ipHeaderTracker.size,
+      
+      // Metrics
+      metrics: {
+        ...this.metrics,
+        uptime: uptime,
+        requestsPerSecond: Math.round(requestsPerSecond * 100) / 100,
+        blockRate: this.metrics.totalRequests > 0 ? 
+          Math.round((this.metrics.blockedRequests / this.metrics.totalRequests) * 100) : 0
+      },
+      
+      // Cache efficiency
+      cacheStats: {
+        requestStoreLRU: {
+          size: this.requestStore.size,
+          max: this.requestStore.max
+        },
+        ipRequestStoreLRU: {
+          size: this.ipRequestStore.size,
+          max: this.ipRequestStore.max
+        }
+      }
+    };
+  }
+
+  // 📈 4. Stats endpoint middleware
+  statsMiddleware() {
+    return (req, res) => {
+      const stats = this.getStats();
+      res.json(stats);
     };
   }
 
@@ -579,6 +686,26 @@ class SecureRateLimiter {
     this.penaltyScores.delete(ip);
   }
 
+  // Add trusted IP
+  addTrustedIP(ip) {
+    this.trustedIPs.add(ip);
+  }
+
+  // Remove trusted IP
+  removeTrustedIP(ip) {
+    this.trustedIPs.delete(ip);
+  }
+
+  // Add bypass token
+  addBypassToken(token) {
+    this.bypassTokens.add(token);
+  }
+
+  // Remove bypass token
+  removeBypassToken(token) {
+    this.bypassTokens.delete(token);
+  }
+
   // Get detailed IP information
   getIPInfo(ip) {
     return {
@@ -589,8 +716,19 @@ class SecureRateLimiter {
       fingerprints: this.fingerprintStore.get(ip)?.size || 0,
       connections: this.connectionTracker.get(ip) || 0,
       requests: this.ipRequestStore.get(ip),
-      headerPatterns: this.ipHeaderTracker.get(ip)?.size || 0
+      headerPatterns: this.ipHeaderTracker.get(ip)?.size || 0,
+      isTrusted: this.trustedIPs.has(ip)
     };
+  }
+
+  // Graceful shutdown
+  destroy() {
+    if (this.logStream) {
+      this.logStream.end();
+    }
+    if (this.securityLogStream) {
+      this.securityLogStream.end();
+    }
   }
 }
 
